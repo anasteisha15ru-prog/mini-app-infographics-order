@@ -1,642 +1,89 @@
-import express from 'express';
-import dotenv from 'dotenv';
-import TelegramBot from 'node-telegram-bot-api';
-import crypto from 'node:crypto';
-import path from 'node:path';
-import fs from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { Pool } from 'pg';
+'use strict';
 
-dotenv.config();
+try {
+  require('dotenv').config();
+} catch (_) {
+  // dotenv не обязателен на Railway
+}
 
-const {
-  BOT_TOKEN,
-  ADMIN_CHAT_ID,
-  WEBAPP_URL,
-  DATABASE_URL,
-  ADMIN_LOGIN,
-  ADMIN_PASSWORD,
-  PORT = 3000,
-  ALLOW_UNSAFE_TEST_MODE = 'false',
-  TEST_USER_ID
-} = process.env;
-
-if (!BOT_TOKEN) throw new Error('Не задан BOT_TOKEN');
-if (!ADMIN_CHAT_ID) throw new Error('Не задан ADMIN_CHAT_ID');
-if (!DATABASE_URL) throw new Error('Не задан DATABASE_URL');
-if (!ADMIN_LOGIN) throw new Error('Не задан ADMIN_LOGIN');
-if (!ADMIN_PASSWORD) throw new Error('Не задан ADMIN_PASSWORD');
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const crypto = require('crypto');
+const express = require('express');
+const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+const PORT = Number(process.env.PORT || 3000);
+
+const BOT_TOKEN = String(process.env.BOT_TOKEN || '').trim();
+const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID);
+const ADMIN_LOGIN = String(process.env.ADMIN_LOGIN || '').trim();
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || '').trim();
+const TELEGRAM_WEBHOOK_SECRET = String(process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
+
+const ADMIN_USER_IDS = parseIdList(process.env.ADMIN_USER_IDS);
+const DESIGNER_USER_IDS = parseIdList(process.env.DESIGNER_USER_IDS);
+
+const ACTION_TO_STATUS = {
+  accept: 'accepted',
+  work: 'in_progress',
+  done: 'done',
+  cancel: 'canceled'
+};
+
+const STATUS_LABELS = {
+  new: '🆕 Новый',
+  accepted: '✅ Принят',
+  in_progress: '🛠 В работе',
+  done: '🎉 Готово',
+  canceled: '❌ Отменён'
+};
+
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL не найден. Подключите PostgreSQL на Railway.');
+}
 
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: DATABASE_URL.includes('localhost')
-    ? false
-    : { rejectUnauthorized: false }
+  connectionString: process.env.DATABASE_URL,
+  ssl:
+    process.env.DATABASE_URL.includes('localhost') ||
+    process.env.DATABASE_URL.includes('127.0.0.1')
+      ? false
+      : { rejectUnauthorized: false }
 });
 
-let bot;
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-const ALLOWED_STATUSES = new Set([
-  'new',
-  'accepted',
-  'in_progress',
-  'done',
-  'cancelled'
-]);
-
-function formatMoney(value) {
-  return `${new Intl.NumberFormat('ru-RU').format(value)} ₽`;
-}
-
-function formatDate(value) {
-  return new Intl.DateTimeFormat('ru-RU', {
-    dateStyle: 'short',
-    timeStyle: 'short'
-  }).format(new Date(value));
-}
-
-function getPricePerSlide(slides) {
-  if (slides <= 20) return 800;
-  if (slides <= 50) return 600;
-  return 500;
-}
-
-function statusLabel(status) {
-  switch (status) {
-    case 'new':
-      return '🆕 Новый';
-    case 'accepted':
-      return '✅ Принят';
-    case 'in_progress':
-      return '🛠 В работе';
-    case 'done':
-      return '🎉 Готов';
-    case 'cancelled':
-      return '❌ Отменён';
-    default:
-      return status;
-  }
-}
-
-function isValidUrl(value) {
+app.get('/health', async (req, res) => {
   try {
-    const url = new URL(value);
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch {
+    await pool.query('SELECT 1');
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    console.error('Health check error:', error);
+    res.status(500).json({ ok: false });
+  }
+});
+
+/* -------------------- ADMIN BASIC AUTH -------------------- */
+
+function safeEqual(a, b) {
+  const aBuffer = Buffer.from(String(a ?? ''));
+  const bBuffer = Buffer.from(String(b ?? ''));
+
+  if (aBuffer.length !== bBuffer.length) {
     return false;
   }
-}
 
-function normalizeText(value) {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function parseSlides(value) {
-  const num = Number(value);
-  return Number.isInteger(num) ? num : null;
-}
-
-function isItemEmpty(item) {
-  return (
-    !item.description &&
-    !item.referenceUrl &&
-    !item.competitorUrl &&
-    !item.yandexDiskUrl &&
-    !item.shortWish &&
-    !item.tzUrl &&
-    (item.slides === null || item.slides === undefined || item.slides === '')
-  );
-}
-
-function prepareItems(rawItems) {
-  if (!Array.isArray(rawItems)) {
-    return {
-      preparedItems: [],
-      errors: ['Поле items должно быть массивом']
-    };
-  }
-
-  const preparedItems = [];
-  const errors = [];
-
-  rawItems.forEach((rawItem, index) => {
-    const item = {
-      description: normalizeText(rawItem?.description),
-      referenceUrl: normalizeText(rawItem?.referenceUrl),
-      competitorUrl: normalizeText(rawItem?.competitorUrl),
-      yandexDiskUrl: normalizeText(rawItem?.yandexDiskUrl),
-      slides: parseSlides(rawItem?.slides),
-      shortWish: normalizeText(rawItem?.shortWish),
-      tzUrl: normalizeText(rawItem?.tzUrl)
-    };
-
-    if (isItemEmpty(item)) {
-      return;
-    }
-
-    const itemErrors = [];
-
-    if (!item.description) {
-      itemErrors.push(`Позиция ${index + 1}: заполните "Описание товара"`);
-    }
-
-    if (!item.referenceUrl) {
-      itemErrors.push(`Позиция ${index + 1}: заполните "Референс (ссылка)"`);
-    } else if (!isValidUrl(item.referenceUrl)) {
-      itemErrors.push(`Позиция ${index + 1}: "Референс" должен быть корректной ссылкой`);
-    }
-
-    if (!item.competitorUrl) {
-      itemErrors.push(`Позиция ${index + 1}: заполните "Ссылка на конкурента"`);
-    } else if (!isValidUrl(item.competitorUrl)) {
-      itemErrors.push(`Позиция ${index + 1}: "Ссылка на конкурента" должна быть корректной ссылкой`);
-    }
-
-    if (!item.yandexDiskUrl) {
-      itemErrors.push(`Позиция ${index + 1}: заполните "Ссылка на Яндекс.Диск"`);
-    } else if (!isValidUrl(item.yandexDiskUrl)) {
-      itemErrors.push(`Позиция ${index + 1}: "Ссылка на Яндекс.Диск" должна быть корректной ссылкой`);
-    }
-
-    if (item.slides === null || item.slides < 1 || item.slides > 500) {
-      itemErrors.push(`Позиция ${index + 1}: "Количество слайдов" должно быть числом от 1 до 500`);
-    }
-
-    if (item.tzUrl && !isValidUrl(item.tzUrl)) {
-      itemErrors.push(`Позиция ${index + 1}: "Ссылка на ТЗ" должна быть корректной ссылкой`);
-    }
-
-    if (itemErrors.length > 0) {
-      errors.push(...itemErrors);
-      return;
-    }
-
-    const pricePerSlide = getPricePerSlide(item.slides);
-    const total = pricePerSlide * item.slides;
-
-    preparedItems.push({
-      ...item,
-      pricePerSlide,
-      total
-    });
-  });
-
-  return { preparedItems, errors };
-}
-
-function createOrderId() {
-  const now = new Date();
-  const date = now.toISOString().slice(0, 10).replace(/-/g, '');
-  const rand = Math.random().toString(36).slice(2, 6).toUpperCase();
-  return `ORD-${date}-${rand}`;
-}
-
-function verifyTelegramWebAppData(initData, botToken) {
-  try {
-    const params = new URLSearchParams(initData);
-    const hash = params.get('hash');
-    if (!hash) return false;
-
-    params.delete('hash');
-
-    const dataCheckString = [...params.entries()]
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([key, value]) => `${key}=${value}`)
-      .join('\n');
-
-    const secretKey = crypto
-      .createHmac('sha256', 'WebAppData')
-      .update(botToken)
-      .digest();
-
-    const calculatedHash = crypto
-      .createHmac('sha256', secretKey)
-      .update(dataCheckString)
-      .digest('hex');
-
-    const hashBuffer = Buffer.from(hash, 'hex');
-    const calculatedBuffer = Buffer.from(calculatedHash, 'hex');
-
-    return (
-      hashBuffer.length === calculatedBuffer.length &&
-      crypto.timingSafeEqual(hashBuffer, calculatedBuffer)
-    );
-  } catch {
-    return false;
-  }
-}
-
-function getTelegramUserFromInitData(initData) {
-  if (!initData || !verifyTelegramWebAppData(initData, BOT_TOKEN)) {
-    return null;
-  }
-
-  try {
-    const params = new URLSearchParams(initData);
-    const rawUser = params.get('user');
-    return rawUser ? JSON.parse(rawUser) : null;
-  } catch {
-    return null;
-  }
-}
-
-function buildStatusKeyboard(publicId) {
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ Принять', callback_data: `st|${publicId}|accepted` },
-        { text: '🛠 В работу', callback_data: `st|${publicId}|in_progress` }
-      ],
-      [
-        { text: '🎉 Готово', callback_data: `st|${publicId}|done` },
-        { text: '❌ Отменить', callback_data: `st|${publicId}|cancelled` }
-      ]
-    ]
-  };
-}
-
-function formatOrderMessage(order, { forAdmin = false } = {}) {
-  const userName =
-    [order.customer_first_name, order.customer_last_name]
-      .filter(Boolean)
-      .join(' ')
-      .trim() || 'Без имени';
-
-  const username = order.customer_username ? `@${order.customer_username}` : '—';
-
-  const header = forAdmin
-    ? [
-        `🆕 Новый заказ ${order.public_id}`,
-        `Статус: ${statusLabel(order.status)}`,
-        `Клиент: ${userName}`,
-        `Username: ${username}`,
-        `Telegram ID: ${order.customer_tg_id}`,
-        `Создан: ${formatDate(order.created_at)}`
-      ].join('\n')
-    : [
-        `✅ Ваш заказ ${order.public_id} принят`,
-        `Предварительный расчёт ниже.`,
-        `Текущий статус: ${statusLabel(order.status)}`
-      ].join('\n');
-
-  const itemsText = order.items
-    .map((item, index) => {
-      return [
-        `📦 Позиция ${index + 1}`,
-        `Описание товара: ${item.description}`,
-        `Референс: ${item.reference_url}`,
-        `Ссылка на конкурента: ${item.competitor_url}`,
-        `Ссылка на Яндекс.Диск: ${item.yandex_disk_url}`,
-        `Количество слайдов: ${item.slides}`,
-        `Цена за слайд: ${formatMoney(item.price_per_slide)}`,
-        `Сумма позиции: ${formatMoney(item.total_amount)}`,
-        `Краткое пожелание: ${item.short_wish || '—'}`,
-        `Ссылка на ТЗ: ${item.tz_url || '—'}`
-      ].join('\n');
-    })
-    .join('\n\n');
-
-  return `${header}\n\n${itemsText}\n\n💰 Общая сумма: ${formatMoney(order.total_amount)}`;
-}
-
-function formatStatusChangeMessage(order, comment = '') {
-  return [
-    `ℹ️ Обновление по заказу ${order.public_id}`,
-    `Новый статус: ${statusLabel(order.status)}`,
-    comment ? `Комментарий: ${comment}` : ''
-  ]
-    .filter(Boolean)
-    .join('\n');
-}
-
-async function sendLongMessage(chatId, text, options = {}) {
-  const maxLength = 3900;
-
-  if (text.length <= maxLength) {
-    await bot.sendMessage(chatId, text, {
-      disable_web_page_preview: true,
-      ...options
-    });
-    return;
-  }
-
-  const parts = [];
-  let current = '';
-
-  for (const block of text.split('\n\n')) {
-    const next = current ? `${current}\n\n${block}` : block;
-
-    if (next.length > maxLength) {
-      if (current) {
-        parts.push(current);
-      }
-
-      if (block.length > maxLength) {
-        for (let i = 0; i < block.length; i += maxLength) {
-          parts.push(block.slice(i, i + maxLength));
-        }
-        current = '';
-      } else {
-        current = block;
-      }
-    } else {
-      current = next;
-    }
-  }
-
-  if (current) {
-    parts.push(current);
-  }
-
-  for (let i = 0; i < parts.length; i += 1) {
-    await bot.sendMessage(chatId, parts[i], {
-      disable_web_page_preview: true,
-      ...(i === 0 ? options : {})
-    });
-  }
-}
-
-async function runMigrations() {
-  const migrationPath = path.join(__dirname, 'migrations', '001_init.sql');
-  const sql = fs.readFileSync(migrationPath, 'utf8');
-  await pool.query(sql);
-  console.log('Migrations applied');
-}
-
-async function createOrderInDb(user, items, total) {
-  const client = await pool.connect();
-
-  try {
-    await client.query('BEGIN');
-
-    const publicId = createOrderId();
-
-    const orderRes = await client.query(
-      `
-      INSERT INTO orders (
-        public_id,
-        customer_tg_id,
-        customer_username,
-        customer_first_name,
-        customer_last_name,
-        status,
-        total_amount
-      )
-      VALUES ($1, $2, $3, $4, $5, 'new', $6)
-      RETURNING *
-      `,
-      [
-        publicId,
-        user.id,
-        user.username || null,
-        user.first_name || null,
-        user.last_name || null,
-        total
-      ]
-    );
-
-    const order = orderRes.rows[0];
-
-    for (let i = 0; i < items.length; i += 1) {
-      const item = items[i];
-
-      await client.query(
-        `
-        INSERT INTO order_items (
-          order_id,
-          position_number,
-          description,
-          reference_url,
-          competitor_url,
-          yandex_disk_url,
-          slides,
-          short_wish,
-          tz_url,
-          price_per_slide,
-          total_amount
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-        `,
-        [
-          order.id,
-          i + 1,
-          item.description,
-          item.referenceUrl,
-          item.competitorUrl,
-          item.yandexDiskUrl,
-          item.slides,
-          item.shortWish || null,
-          item.tzUrl || null,
-          item.pricePerSlide,
-          item.total
-        ]
-      );
-    }
-
-    await client.query(
-      `
-      INSERT INTO order_status_history (
-        order_id,
-        old_status,
-        new_status,
-        comment,
-        changed_by
-      )
-      VALUES ($1, $2, $3, $4, $5)
-      `,
-      [order.id, null, 'new', 'Заказ создан', 'system']
-    );
-
-    await client.query('COMMIT');
-
-    return publicId;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-async function getOrderByPublicId(publicId) {
-  const orderRes = await pool.query(
-    `SELECT * FROM orders WHERE public_id = $1 LIMIT 1`,
-    [publicId]
-  );
-
-  const order = orderRes.rows[0];
-  if (!order) return null;
-
-  const itemsRes = await pool.query(
-    `
-    SELECT *
-    FROM order_items
-    WHERE order_id = $1
-    ORDER BY position_number ASC
-    `,
-    [order.id]
-  );
-
-  const historyRes = await pool.query(
-    `
-    SELECT *
-    FROM order_status_history
-    WHERE order_id = $1
-    ORDER BY created_at DESC
-    `,
-    [order.id]
-  );
-
-  return {
-    ...order,
-    items: itemsRes.rows,
-    history: historyRes.rows
-  };
-}
-
-async function updateClientNotified(orderId, value) {
-  await pool.query(
-    `
-    UPDATE orders
-    SET client_notified = $1,
-        updated_at = NOW()
-    WHERE id = $2
-    `,
-    [value, orderId]
-  );
-}
-
-async function listOrders({ status = 'all', q = '', page = 1, pageSize = 20 }) {
-  const where = [];
-  const values = [];
-
-  if (status && status !== 'all') {
-    values.push(status);
-    where.push(`o.status = $${values.length}`);
-  }
-
-  if (q) {
-    values.push(`%${q}%`);
-    where.push(`
-      (
-        o.public_id ILIKE $${values.length}
-        OR COALESCE(o.customer_username, '') ILIKE $${values.length}
-        OR COALESCE(o.customer_first_name, '') ILIKE $${values.length}
-        OR COALESCE(o.customer_last_name, '') ILIKE $${values.length}
-      )
-    `);
-  }
-
-  const offset = (page - 1) * pageSize;
-  values.push(pageSize);
-  const limitPlaceholder = `$${values.length}`;
-  values.push(offset);
-  const offsetPlaceholder = `$${values.length}`;
-
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-
-  const sql = `
-    SELECT
-      o.id,
-      o.public_id,
-      o.customer_tg_id,
-      o.customer_username,
-      o.customer_first_name,
-      o.customer_last_name,
-      o.status,
-      o.total_amount,
-      o.client_notified,
-      o.created_at,
-      o.updated_at,
-      COUNT(oi.id)::int AS items_count
-    FROM orders o
-    LEFT JOIN order_items oi ON oi.order_id = o.id
-    ${whereSql}
-    GROUP BY o.id
-    ORDER BY o.created_at DESC
-    LIMIT ${limitPlaceholder}
-    OFFSET ${offsetPlaceholder}
-  `;
-
-  const result = await pool.query(sql, values);
-  return result.rows;
-}
-
-async function setOrderStatus({ publicId, newStatus, comment = '', changedBy = 'admin' }) {
-  if (!ALLOWED_STATUSES.has(newStatus)) {
-    throw new Error('Недопустимый статус');
-  }
-
-  const client = await pool.connect();
-
-  try {
-    await client.query('BEGIN');
-
-    const currentRes = await client.query(
-      `SELECT * FROM orders WHERE public_id = $1 FOR UPDATE`,
-      [publicId]
-    );
-
-    const current = currentRes.rows[0];
-    if (!current) {
-      throw new Error('Заказ не найден');
-    }
-
-    const oldStatus = current.status;
-
-    if (oldStatus !== newStatus || comment) {
-      await client.query(
-        `
-        UPDATE orders
-        SET status = $1,
-            updated_at = NOW()
-        WHERE id = $2
-        `,
-        [newStatus, current.id]
-      );
-
-      await client.query(
-        `
-        INSERT INTO order_status_history (
-          order_id,
-          old_status,
-          new_status,
-          comment,
-          changed_by
-        )
-        VALUES ($1, $2, $3, $4, $5)
-        `,
-        [current.id, oldStatus, newStatus, comment || null, changedBy]
-      );
-    }
-
-    await client.query('COMMIT');
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
-
-  return getOrderByPublicId(publicId);
-}
-
-async function notifyClientStatusChanged(order, comment = '') {
-  try {
-    await sendLongMessage(order.customer_tg_id, formatStatusChangeMessage(order, comment));
-  } catch (error) {
-    console.error('Не удалось уведомить клиента о смене статуса:', error.message);
-  }
+  return crypto.timingSafeEqual(aBuffer, bBuffer);
 }
 
 function adminBasicAuth(req, res, next) {
+  // Если логин/пароль не заданы, просто пропускаем
+  if (!ADMIN_LOGIN && !ADMIN_PASSWORD) {
+    return next();
+  }
+
   const authHeader = req.headers.authorization || '';
 
   if (!authHeader.startsWith('Basic ')) {
@@ -644,282 +91,770 @@ function adminBasicAuth(req, res, next) {
     return res.status(401).send('Authentication required');
   }
 
-  const encoded = authHeader.slice(6);
-  const decoded = Buffer.from(encoded, 'base64').toString('utf8');
-  const separatorIndex = decoded.indexOf(':');
+  try {
+    const encoded = authHeader.slice(6);
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    const separatorIndex = decoded.indexOf(':');
 
-  const login = separatorIndex >= 0 ? decoded.slice(0, separatorIndex) : '';
-  const password = separatorIndex >= 0 ? decoded.slice(separatorIndex + 1) : '';
+    const login = separatorIndex >= 0 ? decoded.slice(0, separatorIndex) : '';
+    const password = separatorIndex >= 0 ? decoded.slice(separatorIndex + 1) : '';
 
-  const isValid =
-    crypto.timingSafeEqual(Buffer.from(login), Buffer.from(ADMIN_LOGIN)) &&
-    crypto.timingSafeEqual(Buffer.from(password), Buffer.from(ADMIN_PASSWORD));
+    const loginOk = safeEqual(login, ADMIN_LOGIN);
+    const passwordOk = safeEqual(password, ADMIN_PASSWORD);
 
-  if (!isValid) {
+    if (!loginOk || !passwordOk) {
+      res.set('WWW-Authenticate', 'Basic realm="Admin Panel"');
+      return res.status(401).send('Invalid credentials');
+    }
+
+    return next();
+  } catch (error) {
+    console.error('Admin auth error:', error);
     res.set('WWW-Authenticate', 'Basic realm="Admin Panel"');
     return res.status(401).send('Invalid credentials');
   }
-
-  next();
 }
 
-app.get('/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ ok: true });
-  } catch (error) {
-    res.status(500).json({ ok: false });
-  }
-});
-
 app.get('/admin', adminBasicAuth, (req, res) => {
-  res.sendFile(path.join(__dirname, 'private', 'admin.html'));
-});
+  const adminFilePath = path.join(__dirname, 'private', 'admin.html');
 
-app.get('/api/admin/orders', adminBasicAuth, async (req, res) => {
-  try {
-    const status = String(req.query.status || 'all');
-    const q = String(req.query.q || '').trim();
-    const page = Math.max(1, Number(req.query.page || 1));
-    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize || 20)));
+  res.sendFile(adminFilePath, (err) => {
+    if (err) {
+      console.error('Ошибка отправки admin.html:', adminFilePath, err);
 
-    const orders = await listOrders({ status, q, page, pageSize });
-
-    res.json({
-      ok: true,
-      orders
-    });
-  } catch (error) {
-    console.error('Ошибка получения списка заказов:', error);
-    res.status(500).json({
-      ok: false,
-      error: 'Не удалось получить список заказов'
-    });
-  }
-});
-
-app.get('/api/admin/orders/:publicId', adminBasicAuth, async (req, res) => {
-  try {
-    const order = await getOrderByPublicId(req.params.publicId);
-
-    if (!order) {
-      return res.status(404).json({
-        ok: false,
-        error: 'Заказ не найден'
-      });
-    }
-
-    res.json({
-      ok: true,
-      order
-    });
-  } catch (error) {
-    console.error('Ошибка получения заказа:', error);
-    res.status(500).json({
-      ok: false,
-      error: 'Не удалось получить заказ'
-    });
-  }
-});
-
-app.patch('/api/admin/orders/:publicId/status', adminBasicAuth, async (req, res) => {
-  try {
-    const newStatus = String(req.body?.status || '').trim();
-    const comment = normalizeText(req.body?.comment);
-
-    const order = await setOrderStatus({
-      publicId: req.params.publicId,
-      newStatus,
-      comment,
-      changedBy: 'admin-panel'
-    });
-
-    await notifyClientStatusChanged(order, comment);
-
-    res.json({
-      ok: true,
-      order
-    });
-  } catch (error) {
-    console.error('Ошибка обновления статуса:', error);
-    res.status(400).json({
-      ok: false,
-      error: error.message || 'Не удалось обновить статус'
-    });
-  }
-});
-
-app.post('/api/order', async (req, res) => {
-  try {
-    const { initData, items } = req.body || {};
-
-    let user = getTelegramUserFromInitData(initData);
-    const allowUnsafeTestMode = ALLOW_UNSAFE_TEST_MODE === 'true';
-
-    if (!user && allowUnsafeTestMode) {
-      user = {
-        id: Number(TEST_USER_ID || ADMIN_CHAT_ID),
-        first_name: 'Test',
-        last_name: 'User',
-        username: 'test_user'
-      };
-    }
-
-    if (!user?.id) {
-      return res.status(401).json({
-        ok: false,
-        error: 'Не удалось проверить Telegram WebApp данные'
-      });
-    }
-
-    const { preparedItems, errors } = prepareItems(items);
-
-    if (errors.length > 0) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Ошибка валидации',
-        details: errors
-      });
-    }
-
-    if (preparedItems.length === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Добавьте хотя бы одну корректно заполненную позицию'
-      });
-    }
-
-    const total = preparedItems.reduce((sum, item) => sum + item.total, 0);
-    const publicId = await createOrderInDb(user, preparedItems, total);
-    const order = await getOrderByPublicId(publicId);
-
-    await sendLongMessage(
-      ADMIN_CHAT_ID,
-      formatOrderMessage(order, { forAdmin: true }),
-      {
-        reply_markup: buildStatusKeyboard(order.public_id)
+      if (!res.headersSent) {
+        res.status(err.statusCode || 500).send('Internal Server Error');
       }
-    );
-
-    let clientNotified = true;
-
-    try {
-      await sendLongMessage(user.id, formatOrderMessage(order, { forAdmin: false }));
-      await updateClientNotified(order.id, true);
-    } catch (error) {
-      clientNotified = false;
-      console.error('Не удалось отправить подтверждение клиенту:', error.message);
     }
-
-    return res.json({
-      ok: true,
-      orderId: order.public_id,
-      total: order.total_amount,
-      clientNotified
-    });
-  } catch (error) {
-    console.error('Ошибка /api/order:', error);
-    return res.status(500).json({
-      ok: false,
-      error: 'Внутренняя ошибка сервера'
-    });
-  }
+  });
 });
 
-async function initBot() {
-  bot = new TelegramBot(BOT_TOKEN, { polling: true });
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
-  bot.on('polling_error', (error) => {
-    console.error('Polling error:', error.message);
+/* -------------------- HELPERS -------------------- */
+
+function parseIdList(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => Number(item))
+    .filter(Number.isFinite);
+}
+
+function canManageOrders(userId) {
+  const id = Number(userId);
+  return ADMIN_USER_IDS.includes(id) || DESIGNER_USER_IDS.includes(id);
+}
+
+function parseItems(value) {
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  return [];
+}
+
+function safeText(value) {
+  return String(value ?? '').trim();
+}
+
+function normalizeUsername(value) {
+  return safeText(value).replace(/^@+/, '');
+}
+
+function normalizeNumber(value, fallback = 0) {
+  if (value === null || value === undefined || value === '') {
+    return fallback;
+  }
+
+  const normalized = String(value).replace(',', '.').replace(/\s+/g, '');
+  const result = Number(normalized);
+
+  return Number.isFinite(result) ? result : fallback;
+}
+
+function normalizeInteger(value, fallback = 0) {
+  const result = Math.trunc(normalizeNumber(value, fallback));
+  return Number.isFinite(result) ? result : fallback;
+}
+
+function normalizeOptionalNumber(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  const result = Number(String(value).trim());
+  return Number.isFinite(result) ? result : null;
+}
+
+function clip(value, max = 300) {
+  const text = safeText(value);
+
+  if (text.length <= max) {
+    return text;
+  }
+
+  return `${text.slice(0, max - 1)}…`;
+}
+
+function formatMoney(value) {
+  const amount = normalizeNumber(value, 0);
+
+  return `${new Intl.NumberFormat('ru-RU', {
+    minimumFractionDigits: Number.isInteger(amount) ? 0 : 2,
+    maximumFractionDigits: 2
+  }).format(amount)} ₽`;
+}
+
+function formatDate(value) {
+  try {
+    return new Intl.DateTimeFormat('ru-RU', {
+      dateStyle: 'short',
+      timeStyle: 'short'
+    }).format(new Date(value));
+  } catch (_) {
+    return safeText(value);
+  }
+}
+
+function normalizeItem(rawItem, index) {
+  const slidesCount = normalizeInteger(
+    rawItem.slidesCount ?? rawItem.slides_count ?? rawItem.count,
+    0
+  );
+
+  const pricePerSlide = normalizeNumber(
+    rawItem.pricePerSlide ?? rawItem.price_per_slide ?? rawItem.price,
+    0
+  );
+
+  const amount = normalizeNumber(
+    rawItem.amount ?? rawItem.total ?? slidesCount * pricePerSlide,
+    slidesCount * pricePerSlide
+  );
+
+  return {
+    positionIndex: index + 1,
+    title: safeText(rawItem.title ?? rawItem.name ?? ''),
+    description: safeText(rawItem.description ?? rawItem.productDescription ?? ''),
+    referenceLink: safeText(rawItem.referenceLink ?? rawItem.reference ?? rawItem.ref ?? ''),
+    competitorLink: safeText(rawItem.competitorLink ?? rawItem.competitor ?? ''),
+    sourceLink: safeText(
+      rawItem.sourceLink ??
+        rawItem.materialsLink ??
+        rawItem.diskLink ??
+        rawItem.yandexDiskLink ??
+        ''
+    ),
+    slidesCount,
+    pricePerSlide,
+    amount,
+    wish: safeText(rawItem.wish ?? rawItem.shortWish ?? rawItem.note ?? ''),
+    tzLink: safeText(rawItem.tzLink ?? rawItem.technicalTaskLink ?? rawItem.tz ?? '')
+  };
+}
+
+function buildOrderInlineKeyboard(orderId, currentStatus = 'new') {
+  const mark = (status, text) => (currentStatus === status ? `• ${text}` : text);
+
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: mark('accepted', '✅ Принять'),
+          callback_data: `order:accept:${orderId}`
+        },
+        {
+          text: mark('in_progress', '🛠 В работу'),
+          callback_data: `order:work:${orderId}`
+        }
+      ],
+      [
+        {
+          text: mark('done', '🎉 Готово'),
+          callback_data: `order:done:${orderId}`
+        },
+        {
+          text: mark('canceled', '❌ Отменить'),
+          callback_data: `order:cancel:${orderId}`
+        }
+      ]
+    ]
+  };
+}
+
+function buildOrderText(order, items) {
+  const lines = [];
+
+  lines.push(`📦 Заказ #${order.id}`);
+  lines.push(`Статус: ${STATUS_LABELS[order.status] || order.status || '—'}`);
+  lines.push(`Создан: ${formatDate(order.created_at)}`);
+
+  if (order.customer_name) {
+    lines.push(`Клиент: ${clip(order.customer_name, 120)}`);
+  }
+
+  if (order.customer_username) {
+    lines.push(`Username: @${clip(order.customer_username, 120)}`);
+  }
+
+  if (order.customer_telegram_id) {
+    lines.push(`Telegram ID: ${order.customer_telegram_id}`);
+  }
+
+  if (order.comment) {
+    lines.push(`Комментарий: ${clip(order.comment, 500)}`);
+  }
+
+  for (const item of items) {
+    lines.push('');
+    lines.push(`📦 Позиция ${item.position_index}`);
+
+    if (item.title) {
+      lines.push(`Название: ${clip(item.title, 180)}`);
+    }
+
+    if (item.description) {
+      lines.push(`Описание товара: ${clip(item.description, 500)}`);
+    }
+
+    if (item.reference_link) {
+      lines.push(`Референс: ${clip(item.reference_link, 400)}`);
+    }
+
+    if (item.competitor_link) {
+      lines.push(`Ссылка на конкурента: ${clip(item.competitor_link, 400)}`);
+    }
+
+    if (item.source_link) {
+      lines.push(`Ссылка на Яндекс.Диск: ${clip(item.source_link, 400)}`);
+    }
+
+    lines.push(`Количество слайдов: ${item.slides_count || 0}`);
+    lines.push(`Цена за слайд: ${formatMoney(item.price_per_slide || 0)}`);
+    lines.push(`Сумма позиции: ${formatMoney(item.amount || 0)}`);
+
+    if (item.wish) {
+      lines.push(`Краткое пожелание: ${clip(item.wish, 400)}`);
+    }
+
+    if (item.tz_link) {
+      lines.push(`Ссылка на ТЗ: ${clip(item.tz_link, 400)}`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`💰 Общая сумма: ${formatMoney(order.total_amount || 0)}`);
+
+  const fullText = lines.join('\n');
+
+  // Telegram limit ~4096 символов
+  return fullText.length > 3900 ? `${fullText.slice(0, 3899)}…` : fullText;
+}
+
+/* -------------------- TELEGRAM API -------------------- */
+
+async function telegramApi(method, payload) {
+  if (typeof fetch !== 'function') {
+    throw new Error('Нужен Node.js 18+ (fetch недоступен)');
+  }
+
+  if (!BOT_TOKEN) {
+    throw new Error('BOT_TOKEN не задан');
+  }
+
+  const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
   });
 
-  await bot.setMyCommands([
-    { command: 'start', description: 'Открыть форму заказа' },
-    { command: 'id', description: 'Показать ваш Telegram ID' }
-  ]).catch(() => {});
+  const data = await response.json().catch(() => null);
 
-  bot.onText(/\/start/, async (msg) => {
-    if (!WEBAPP_URL) {
-      await bot.sendMessage(
-        msg.chat.id,
-        'Бот запущен, но переменная WEBAPP_URL пока не настроена.'
-      );
+  if (!response.ok || !data || !data.ok) {
+    throw new Error(`Telegram API ${method} error: ${JSON.stringify(data)}`);
+  }
+
+  return data.result;
+}
+
+async function answerCallbackQuery(callbackQueryId, text, showAlert = false) {
+  return telegramApi('answerCallbackQuery', {
+    callback_query_id: callbackQueryId,
+    text,
+    show_alert: showAlert
+  });
+}
+
+async function sendOrderToTelegram(order, items) {
+  if (!Number.isFinite(ADMIN_CHAT_ID)) {
+    throw new Error('ADMIN_CHAT_ID не задан или некорректен');
+  }
+
+  const text = buildOrderText(order, items);
+
+  return telegramApi('sendMessage', {
+    chat_id: ADMIN_CHAT_ID,
+    text,
+    reply_markup: buildOrderInlineKeyboard(order.id, order.status || 'new'),
+    disable_web_page_preview: true
+  });
+}
+
+async function editOrderTelegramMessage(order, fallbackMessage) {
+  const chatId = Number(order.telegram_chat_id ?? fallbackMessage?.chat?.id);
+  const messageId = Number(order.telegram_message_id ?? fallbackMessage?.message_id);
+
+  if (!Number.isFinite(chatId) || !Number.isFinite(messageId)) {
+    return;
+  }
+
+  const text = buildOrderText(order, order.items || []);
+
+  try {
+    await telegramApi('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      reply_markup: buildOrderInlineKeyboard(order.id, order.status || 'new'),
+      disable_web_page_preview: true
+    });
+  } catch (error) {
+    if (String(error.message).includes('message is not modified')) {
       return;
     }
 
-    await bot.sendMessage(
-      msg.chat.id,
-      'Откройте форму заказа:',
-      {
-        reply_markup: {
-          keyboard: [
-            [
-              {
-                text: 'Открыть форму заказа',
-                web_app: { url: WEBAPP_URL }
-              }
-            ]
-          ],
-          resize_keyboard: true,
-          persistent: true
-        }
-      }
-    );
-  });
+    throw error;
+  }
+}
 
-  bot.onText(/\/id/, async (msg) => {
-    await bot.sendMessage(msg.chat.id, `Ваш chat_id: ${msg.chat.id}`);
-  });
+/* -------------------- DATABASE -------------------- */
 
-  bot.on('callback_query', async (query) => {
-    try {
-      if (String(query.from.id) !== String(ADMIN_CHAT_ID)) {
-        await bot.answerCallbackQuery(query.id, {
-          text: 'Недостаточно прав',
-          show_alert: true
-        });
-        return;
-      }
+async function ensureSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id BIGSERIAL PRIMARY KEY
+    )
+  `);
 
-      const [prefix, publicId, newStatus] = String(query.data || '').split('|');
+  const orderAlterStatements = [
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_name TEXT`,
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_username TEXT`,
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_telegram_id BIGINT`,
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS comment TEXT`,
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_amount NUMERIC(12,2) NOT NULL DEFAULT 0`,
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'new'`,
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS telegram_chat_id BIGINT`,
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT`,
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
+  ];
 
-      if (prefix !== 'st' || !publicId || !ALLOWED_STATUSES.has(newStatus)) {
-        await bot.answerCallbackQuery(query.id, {
-          text: 'Некорректная команда'
-        });
-        return;
-      }
+  for (const sql of orderAlterStatements) {
+    await pool.query(sql);
+  }
 
-      const order = await setOrderStatus({
-        publicId,
-        newStatus,
-        comment: '',
-        changedBy: `telegram:${query.from.id}`
-      });
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS order_items (
+      id BIGSERIAL PRIMARY KEY,
+      order_id BIGINT REFERENCES orders(id) ON DELETE CASCADE,
+      position_index INTEGER NOT NULL DEFAULT 1,
+      title TEXT,
+      description TEXT,
+      reference_link TEXT,
+      competitor_link TEXT,
+      source_link TEXT,
+      slides_count INTEGER NOT NULL DEFAULT 0,
+      price_per_slide NUMERIC(12,2) NOT NULL DEFAULT 0,
+      amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+      wish TEXT,
+      tz_link TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 
-      await notifyClientStatusChanged(order);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_order_items_order_id
+    ON order_items(order_id)
+  `);
+}
 
-      await bot.answerCallbackQuery(query.id, {
-        text: `Статус: ${statusLabel(newStatus)}`
-      });
+async function getOrderWithItems(orderId) {
+  const orderResult = await pool.query(
+    `
+      SELECT
+        id,
+        customer_name,
+        customer_username,
+        customer_telegram_id,
+        comment,
+        total_amount,
+        status,
+        telegram_chat_id,
+        telegram_message_id,
+        created_at,
+        updated_at
+      FROM orders
+      WHERE id = $1
+      LIMIT 1
+    `,
+    [orderId]
+  );
 
-      await bot.sendMessage(
-        ADMIN_CHAT_ID,
-        `Заказ ${publicId}: статус изменён на ${statusLabel(newStatus)}`
+  if (orderResult.rows.length === 0) {
+    return null;
+  }
+
+  const itemsResult = await pool.query(
+    `
+      SELECT
+        id,
+        order_id,
+        position_index,
+        title,
+        description,
+        reference_link,
+        competitor_link,
+        source_link,
+        slides_count,
+        price_per_slide,
+        amount,
+        wish,
+        tz_link,
+        created_at
+      FROM order_items
+      WHERE order_id = $1
+      ORDER BY position_index ASC, id ASC
+    `,
+    [orderId]
+  );
+
+  const order = orderResult.rows[0];
+  order.items = itemsResult.rows;
+
+  return order;
+}
+
+async function updateOrderStatus(orderId, status) {
+  const result = await pool.query(
+    `
+      UPDATE orders
+      SET status = $1,
+          updated_at = NOW()
+      WHERE id = $2
+      RETURNING id, status
+    `,
+    [status, orderId]
+  );
+
+  return result.rows[0] || null;
+}
+
+/* -------------------- CREATE ORDER API -------------------- */
+
+async function createOrderHandler(req, res) {
+  const body = req.body || {};
+
+  const rawItems = parseItems(body.items ?? body.positions ?? body.orderItems);
+
+  if (!rawItems.length) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Добавьте хотя бы одну позицию'
+    });
+  }
+
+  const items = rawItems
+    .map((item, index) => normalizeItem(item, index))
+    .filter((item) => {
+      return Boolean(
+        item.title ||
+          item.description ||
+          item.referenceLink ||
+          item.competitorLink ||
+          item.sourceLink ||
+          item.slidesCount ||
+          item.pricePerSlide ||
+          item.amount ||
+          item.wish ||
+          item.tzLink
       );
-    } catch (error) {
-      console.error('Ошибка callback_query:', error);
-      await bot.answerCallbackQuery(query.id, {
-        text: 'Ошибка обновления статуса',
-        show_alert: true
-      });
+    });
+
+  if (!items.length) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Позиции пустые'
+    });
+  }
+
+  const customerName = safeText(
+    body.customerName ??
+      body.customer_name ??
+      body.clientName ??
+      body.name ??
+      body.fullName ??
+      ''
+  );
+
+  const customerUsername = normalizeUsername(
+    body.customerUsername ?? body.customer_username ?? body.username ?? ''
+  );
+
+  const customerTelegramId = normalizeOptionalNumber(
+    body.customerTelegramId ??
+      body.customer_telegram_id ??
+      body.telegramId ??
+      body.telegram_id
+  );
+
+  const comment = safeText(body.comment ?? body.notes ?? body.note ?? '');
+
+  const totalAmount = items.reduce((sum, item) => sum + normalizeNumber(item.amount, 0), 0);
+
+  const client = await pool.connect();
+
+  let order;
+
+  try {
+    await client.query('BEGIN');
+
+    const orderInsertResult = await client.query(
+      `
+        INSERT INTO orders (
+          customer_name,
+          customer_username,
+          customer_telegram_id,
+          comment,
+          total_amount,
+          status,
+          created_at,
+          updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, 'new', NOW(), NOW())
+        RETURNING *
+      `,
+      [
+        customerName || null,
+        customerUsername || null,
+        customerTelegramId,
+        comment || null,
+        totalAmount
+      ]
+    );
+
+    order = orderInsertResult.rows[0];
+
+    for (const item of items) {
+      await client.query(
+        `
+          INSERT INTO order_items (
+            order_id,
+            position_index,
+            title,
+            description,
+            reference_link,
+            competitor_link,
+            source_link,
+            slides_count,
+            price_per_slide,
+            amount,
+            wish,
+            tz_link,
+            created_at
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+        `,
+        [
+          order.id,
+          item.positionIndex,
+          item.title || null,
+          item.description || null,
+          item.referenceLink || null,
+          item.competitorLink || null,
+          item.sourceLink || null,
+          item.slidesCount,
+          item.pricePerSlide,
+          item.amount,
+          item.wish || null,
+          item.tzLink || null
+        ]
+      );
     }
+
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Create order transaction error:', error);
+
+    return res.status(500).json({
+      ok: false,
+      error: 'Не удалось сохранить заказ'
+    });
+  } finally {
+    client.release();
+  }
+
+  let telegramSent = false;
+  let warning = null;
+
+  try {
+    if (BOT_TOKEN && Number.isFinite(ADMIN_CHAT_ID)) {
+      const freshOrder = await getOrderWithItems(order.id);
+      const telegramMessage = await sendOrderToTelegram(freshOrder, freshOrder.items);
+
+      await pool.query(
+        `
+          UPDATE orders
+          SET telegram_chat_id = $1,
+              telegram_message_id = $2,
+              updated_at = NOW()
+          WHERE id = $3
+        `,
+        [telegramMessage.chat.id, telegramMessage.message_id, order.id]
+      );
+
+      telegramSent = true;
+    } else {
+      warning = 'Заказ сохранён, но Telegram не настроен';
+    }
+  } catch (error) {
+    console.error('Telegram send order error:', error);
+    warning = 'Заказ сохранён, но не отправлен в Telegram';
+  }
+
+  return res.status(201).json({
+    ok: true,
+    orderId: order.id,
+    status: 'new',
+    totalAmount,
+    telegramSent,
+    warning
   });
 }
 
+app.post(['/api/orders', '/api/create-order', '/api/submit-order'], createOrderHandler);
+
+/* -------------------- TELEGRAM CALLBACKS -------------------- */
+
+async function handleOrderCallback(callbackQuery) {
+  const rawData = String(callbackQuery?.data || '');
+  const match = /^order:(accept|work|done|cancel):(\d+)$/.exec(rawData);
+
+  if (!match) {
+    await answerCallbackQuery(callbackQuery.id, 'Неизвестное действие', true);
+    return;
+  }
+
+  const actorId = Number(callbackQuery.from?.id);
+
+  if (!canManageOrders(actorId)) {
+    await answerCallbackQuery(callbackQuery.id, 'Недостаточно прав', true);
+    return;
+  }
+
+  const [, action, orderIdRaw] = match;
+  const orderId = Number(orderIdRaw);
+  const nextStatus = ACTION_TO_STATUS[action];
+
+  const order = await getOrderWithItems(orderId);
+
+  if (!order) {
+    await answerCallbackQuery(callbackQuery.id, 'Заказ не найден', true);
+    return;
+  }
+
+  if (String(order.status) === nextStatus) {
+    await answerCallbackQuery(
+      callbackQuery.id,
+      `Статус уже установлен: ${STATUS_LABELS[nextStatus]}`,
+      false
+    );
+    return;
+  }
+
+  const updated = await updateOrderStatus(orderId, nextStatus);
+
+  if (!updated) {
+    await answerCallbackQuery(callbackQuery.id, 'Не удалось обновить статус', true);
+    return;
+  }
+
+  const freshOrder = await getOrderWithItems(orderId);
+
+  await editOrderTelegramMessage(freshOrder, callbackQuery.message);
+
+  await answerCallbackQuery(
+    callbackQuery.id,
+    `Статус изменён: ${STATUS_LABELS[nextStatus]}`,
+    false
+  );
+}
+
+app.post('/telegram/webhook', async (req, res) => {
+  if (TELEGRAM_WEBHOOK_SECRET) {
+    const secretFromHeader = req.get('x-telegram-bot-api-secret-token');
+
+    if (secretFromHeader !== TELEGRAM_WEBHOOK_SECRET) {
+      return res.sendStatus(403);
+    }
+  }
+
+  const update = req.body || {};
+
+  try {
+    if (update.callback_query) {
+      await handleOrderCallback(update.callback_query);
+      return res.sendStatus(200);
+    }
+
+    return res.sendStatus(200);
+  } catch (error) {
+    console.error('Webhook error:', error);
+
+    if (update.callback_query?.id) {
+      try {
+        await answerCallbackQuery(update.callback_query.id, 'Ошибка сервера', true);
+      } catch (answerError) {
+        console.error('answerCallbackQuery error:', answerError);
+      }
+    }
+
+    return res.sendStatus(200);
+  }
+});
+
+/* -------------------- START -------------------- */
+
 async function start() {
-  await runMigrations();
-  await initBot();
+  await ensureSchema();
+  await pool.query('SELECT 1');
+
+  if (!BOT_TOKEN) {
+    console.warn('WARN: BOT_TOKEN не задан');
+  }
+
+  if (!Number.isFinite(ADMIN_CHAT_ID)) {
+    console.warn('WARN: ADMIN_CHAT_ID не задан или некорректен');
+  }
+
+  if (ADMIN_USER_IDS.length === 0 && DESIGNER_USER_IDS.length === 0) {
+    console.warn('WARN: ADMIN_USER_IDS / DESIGNER_USER_IDS пустые — кнопки будут недоступны');
+  }
 
   app.listen(PORT, () => {
     console.log(`Server started on port ${PORT}`);
@@ -927,6 +862,6 @@ async function start() {
 }
 
 start().catch((error) => {
-  console.error('Ошибка запуска приложения:', error);
+  console.error('Startup error:', error);
   process.exit(1);
 });
