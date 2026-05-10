@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Админ-панель заказов</title>
+  <link rel="stylesheet" href="/admin.css" />
+</head>
+<body>
+  <div class="admin-layout">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h1>Заказы</h1>
+        <p>Управление заявками</p>
+      </div>
+
+      <div class="filters">
+        <input id="searchInput" type="text" placeholder="Поиск по ID / username / имени" />
+        <select id="statusFilter">
+          <option value="all">Все статусы</option>
+          <option value="new">Новый</option>
+          <option value="accepted">Принят</option>
+          <option value="in_progress">В работе</option>
+          <option value="done">Готов</option>
+          <option value="cancelled">Отменён</option>
+        </select>
+        <button id="refreshBtn" type="button">Обновить</button>
+      </div>
+
+      <div id="ordersList" class="orders-list"></div>
+    </aside>
+
+    <main class="content">
+      <div id="orderDetails" class="order-details empty">
+        Выберите заказ слева
+      </div>
+    </main>
+  </div>
+
+  <script src="/admin.js"></script>
+</body>
+</html>

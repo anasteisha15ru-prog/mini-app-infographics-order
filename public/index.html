@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+  />
+  <title>Заказ инфографики</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header class="page-header">
+      <h1>Заказ инфографики</h1>
+      <p>Добавьте один или несколько артикулов и отправьте заказ.</p>
+    </header>
+
+    <main>
+      <div id="itemsContainer" class="items-container"></div>
+
+      <button id="addItemBtn" class="secondary-btn" type="button">
+        + Добавить артикул
+      </button>
+
+      <section class="order-summary">
+        <div class="summary-row">
+          <span>Общая сумма:</span>
+          <strong id="grandTotal">0 ₽</strong>
+        </div>
+
+        <button id="submitBtn" class="primary-btn" type="button">
+          Отправить заказ
+        </button>
+      </section>
+
+      <p id="statusMessage" class="status-message"></p>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
